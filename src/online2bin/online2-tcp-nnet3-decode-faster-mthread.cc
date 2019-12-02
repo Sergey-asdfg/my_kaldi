@@ -42,11 +42,6 @@
 
 namespace kaldi {
 
-struct thread_info {
-    pthread_t thread_id;
-    int       thread_num;
-};
-
 class TcpServer {
  public:
   explicit TcpServer();
@@ -72,6 +67,8 @@ class DecodingThread {
 	void StartDecoding();
 
 	bool ReadChunk(size_t len); // get more data and return false if end-of-stream
+	std::string ReadKey(size_t len);
+	bool IsConnected();
 
 	Vector<BaseFloat> GetChunk(); // get the data read by above method
 
@@ -190,7 +187,7 @@ int main(int argc, char *argv[]) {
     int port_num = 5050;
     int read_timeout = 3;
     bool produce_time = false;
-
+	std::string access_key = "";
 
     po.Register("samp-freq", &samp_freq,
                 "Sampling frequency of the input signal (coded as 16-bit slinear).");
@@ -206,6 +203,9 @@ int main(int argc, char *argv[]) {
                 "Port number the server will listen on.");
     po.Register("produce-time", &produce_time,
                 "Prepend begin/end times between endpoints (e.g. '5.46 6.81 <text_output>', in seconds)");
+
+	po.Register("access-key", &access_key,
+		"Access key.");
 
     feature_opts.Register(&po);
     decodable_opts.Register(&po);
@@ -263,18 +263,37 @@ int main(int argc, char *argv[]) {
 
     server.Listen(port_num);
 
+	std::vector<DecodingThread*> decoders;
 
     while (true) {
 
-		int32 client = server.Accept();
+		int32 client = server.Accept();	
 
 		DecodingThread *dec = new DecodingThread(client, read_timeout, &feature_info, &decoder_opts, &trans_model, &decodable_info, decode_fst, &decodable_opts,
 			word_syms, frame_shift, frame_subsampling, &endpoint_opts, chunk_length_secs, output_period, samp_freq);
 		
-		std::thread thread(Work, dec);
-		thread.detach();
+		std::string key = dec->ReadKey(access_key.size());
+		
+		if (access_key.compare(key) != 0)
+		{
+			dec->Disconnect();
+			delete dec;
+		}
+		else {
+			decoders.push_back(dec);
+			std::thread thread(Work, dec);
+			thread.detach();
+		}
 
-
+		std::for_each(decoders.begin(), decoders.end(), [](DecodingThread *d) { 
+			if (d != NULL)
+			{
+				if (!d->IsConnected())
+				{
+					delete d;
+				}
+			}
+		});
     }
   } catch (const std::exception &e) {
     std::cerr << e.what();
@@ -379,6 +398,11 @@ namespace kaldi {
 		chunk_length_secs = chunk_length_secs_;
 		output_period = output_period_;
 		samp_freq = samp_freq_;
+	}
+
+	bool DecodingThread::IsConnected()
+	{
+		return client_desc_ != -1;
 	}
 
 	void DecodingThread::StartDecoding()
@@ -519,16 +543,16 @@ namespace kaldi {
 		while (to_read > 0) {
 			poll_ret = poll(client_set_, 1, read_timeout_);
 			if (poll_ret == 0) {
-				KALDI_WARN << "Socket timeout! Disconnecting...";
+				KALDI_WARN << "Key reading. Socket timeout! Disconnecting...";
 				break;
 			}
 			if (poll_ret < 0) {
-				KALDI_WARN << "Socket error! Disconnecting...";
+				KALDI_WARN << "Key reading. Socket error! Disconnecting...";
 				break;
 			}
 			ret = read(client_desc_, static_cast<void *>(samp_buf_ + has_read_), to_read * sizeof(int16));
 			if (ret <= 0) {
-				KALDI_WARN << "Stream over...";
+				KALDI_WARN << "Key reading. Stream over...";
 				break;
 			}
 			to_read -= ret / sizeof(int16);
@@ -536,6 +560,38 @@ namespace kaldi {
 		}
 
 		return has_read_ > 0;
+	}
+	
+	std::string DecodingThread::ReadKey(size_t len) {
+
+		char key_buff[len];
+
+		ssize_t ret;
+		int poll_ret;
+		size_t to_read = len;
+		size_t bytes_read_ = 0;
+
+		while (to_read > 0) {
+			poll_ret = poll(client_set_, 1, read_timeout_);
+			if (poll_ret == 0) {
+				KALDI_WARN << "Socket timeout! Disconnecting...";
+				break;
+			}
+			if (poll_ret < 0) {
+				KALDI_WARN << "Socket error! Disconnecting...";
+				break;
+			}
+			ret = read(client_desc_, static_cast<void *>(key_buff + bytes_read_), to_read * sizeof(char));
+			if (ret <= 0) {
+				KALDI_WARN << "Stream over...";
+				break;
+			}
+			to_read -= ret / sizeof(char);
+			bytes_read_ += ret / sizeof(char);
+		}
+
+		std::string key(key_buff, len);
+		return key;
 	}
 
 	Vector<BaseFloat> DecodingThread::GetChunk() {
@@ -574,7 +630,9 @@ namespace kaldi {
 
 	void DecodingThread::Disconnect() {
 		if (samp_buf_ != NULL)
+		{
 			delete[] samp_buf_;
+		}
 
 		if (client_desc_ != -1) {
 			close(client_desc_);
