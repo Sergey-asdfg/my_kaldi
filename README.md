@@ -65,3 +65,10 @@ Platform specific notes
   OpenBLAS.
 - See [this blog post](http://jcsilva.github.io/2017/03/18/compile-kaldi-android/)
   for details.
+
+### Created multithreaded version of online2-tcp-nnet3-decode-faster server named online2-tcp-nnet3-decode-faster-mthread
+ - Created online2-tcp-nnet3-decode-faster.cc fork.
+ - Added DecodingThread class, Main function refactored: moved data decoding code to DecodingThread::StartDecoding() method.
+ - Clients connections handling moved to separate threads. Each client connection processed by own thread, without limitaion by threads count.
+ - Added --access-key command line parameter. First client data sended must be a key string, specifyed in this parameter.
+   If client sended key is not fit, connection is closed by server.
