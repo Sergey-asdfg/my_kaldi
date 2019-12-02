@@ -38,33 +38,70 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <string>
+#include <pthread.h>
 
 namespace kaldi {
 
+struct thread_info {
+    pthread_t thread_id;
+    int       thread_num;
+};
+
 class TcpServer {
  public:
-  explicit TcpServer(int read_timeout);
+  explicit TcpServer();
   ~TcpServer();
 
   bool Listen(int32 port);  // start listening on a given port
   int32 Accept();  // accept a client and return its descriptor
 
-  bool ReadChunk(size_t len); // get more data and return false if end-of-stream
+ private:
+	struct ::sockaddr_in h_addr_;
+	int32 server_desc_;
+};
 
-  Vector<BaseFloat> GetChunk(); // get the data read by above method
+class DecodingThread {
+ public:
+	explicit DecodingThread(int32 client_desc, int read_timeout, OnlineNnet2FeaturePipelineInfo *feature_info, LatticeFasterDecoderConfig *decoder_opts,
+		TransitionModel *trans_model, nnet3::DecodableNnetSimpleLoopedInfo *decodable_info, fst::Fst<fst::StdArc> *decode_fst,
+		nnet3::NnetSimpleLoopedComputationOptions *decodable_opts, fst::SymbolTable *word_syms, BaseFloat frame_shift,
+		int32 frame_subsampling, OnlineEndpointConfig *endpoint_opts, BaseFloat chunk_length_secs, BaseFloat output_period,
+		BaseFloat samp_freq);
+	~DecodingThread();
+	
+	void StartDecoding();
 
-  bool Write(const std::string &msg); // write to accepted client
-  bool WriteLn(const std::string &msg, const std::string &eol = "\n"); // write line to accepted client
+	bool ReadChunk(size_t len); // get more data and return false if end-of-stream
 
-  void Disconnect();
+	Vector<BaseFloat> GetChunk(); // get the data read by above method
+
+	bool Write(const std::string &msg); // write to accepted client
+	bool WriteLn(const std::string &msg, const std::string &eol = "\n"); // write line to accepted client
+
+	void Disconnect();
 
  private:
-  struct ::sockaddr_in h_addr_;
-  int32 server_desc_, client_desc_;
-  int16 *samp_buf_;
-  size_t buf_len_, has_read_;
-  pollfd client_set_[1];
-  int read_timeout_;
+	struct ::sockaddr_in h_addr_;
+	int32 server_desc_, client_desc_;
+	int16 *samp_buf_;
+	size_t buf_len_, has_read_;
+	pollfd client_set_[1];
+	int read_timeout_;
+
+	BaseFloat chunk_length_secs = 0.18;
+	BaseFloat output_period = 1;
+	BaseFloat samp_freq = 8000.0;
+
+	OnlineNnet2FeaturePipelineInfo *feature_info;
+	LatticeFasterDecoderConfig *decoder_opts;
+	TransitionModel *trans_model;
+	nnet3::DecodableNnetSimpleLoopedInfo *decodable_info;
+	fst::Fst<fst::StdArc> *decode_fst;
+	nnet3::NnetSimpleLoopedComputationOptions *decodable_opts;
+	fst::SymbolTable *word_syms;
+	BaseFloat frame_shift;
+	int32 frame_subsampling;
+	OnlineEndpointConfig *endpoint_opts;	
 };
 
 std::string LatticeToString(const Lattice &lat, const fst::SymbolTable &word_syms) {
@@ -113,6 +150,12 @@ std::string LatticeToString(const CompactLattice &clat, const fst::SymbolTable &
 }
 }
 
+
+void Work(kaldi::DecodingThread *dec)
+{
+	dec->StartDecoding();
+}
+
 int main(int argc, char *argv[]) {
   try {
     using namespace kaldi;
@@ -147,6 +190,7 @@ int main(int argc, char *argv[]) {
     int port_num = 5050;
     int read_timeout = 3;
     bool produce_time = false;
+
 
     po.Register("samp-freq", &samp_freq,
                 "Sampling frequency of the input signal (coded as 16-bit slinear).");
@@ -207,8 +251,7 @@ int main(int argc, char *argv[]) {
     KALDI_VLOG(1) << "Loading FST...";
 
     fst::Fst<fst::StdArc> *decode_fst = ReadFstKaldiGeneric(fst_rxfilename);
-
-    fst::SymbolTable *word_syms = NULL;
+	fst::SymbolTable *word_syms = NULL;
     if (!word_syms_filename.empty())
       if (!(word_syms = fst::SymbolTable::ReadText(word_syms_filename)))
         KALDI_ERR << "Could not read symbol table from file "
@@ -216,120 +259,22 @@ int main(int argc, char *argv[]) {
 
     signal(SIGPIPE, SIG_IGN); // ignore SIGPIPE to avoid crashing when socket forcefully disconnected
 
-    TcpServer server(read_timeout);
+    TcpServer server;
 
     server.Listen(port_num);
 
+
     while (true) {
 
-      server.Accept();
+		int32 client = server.Accept();
 
-      int32 samp_count = 0;// this is used for output refresh rate
-      size_t chunk_len = static_cast<size_t>(chunk_length_secs * samp_freq);
-      int32 check_period = static_cast<int32>(samp_freq * output_period);
-      int32 check_count = check_period;
+		DecodingThread *dec = new DecodingThread(client, read_timeout, &feature_info, &decoder_opts, &trans_model, &decodable_info, decode_fst, &decodable_opts,
+			word_syms, frame_shift, frame_subsampling, &endpoint_opts, chunk_length_secs, output_period, samp_freq);
+		
+		std::thread thread(Work, dec);
+		thread.detach();
 
-      int32 frame_offset = 0;
 
-      bool eos = false;
-
-      OnlineNnet2FeaturePipeline feature_pipeline(feature_info);
-      SingleUtteranceNnet3Decoder decoder(decoder_opts, trans_model,
-                                          decodable_info,
-                                          *decode_fst, &feature_pipeline);
-
-      while (!eos) {
-
-        decoder.InitDecoding(frame_offset);
-        OnlineSilenceWeighting silence_weighting(
-            trans_model,
-            feature_info.silence_weighting_config,
-            decodable_opts.frame_subsampling_factor);
-        std::vector<std::pair<int32, BaseFloat>> delta_weights;
-
-        while (true) {
-          eos = !server.ReadChunk(chunk_len);
-
-          if (eos) {
-            feature_pipeline.InputFinished();
-            decoder.AdvanceDecoding();
-            decoder.FinalizeDecoding();
-            frame_offset += decoder.NumFramesDecoded();
-            if (decoder.NumFramesDecoded() > 0) {
-              CompactLattice lat;
-              decoder.GetLattice(true, &lat);
-              std::string msg = LatticeToString(lat, *word_syms);
-
-              // get time-span from previous endpoint to end of audio,
-              if (produce_time) {
-                int32 t_beg = frame_offset - decoder.NumFramesDecoded();
-                int32 t_end = frame_offset;
-                msg = GetTimeString(t_beg, t_end, frame_shift * frame_subsampling) + " " + msg;
-              }
-
-              KALDI_VLOG(1) << "EndOfAudio, sending message: " << msg;
-              server.WriteLn(msg);
-            } else
-              server.Write("\n");
-            server.Disconnect();
-            break;
-          }
-
-          Vector<BaseFloat> wave_part = server.GetChunk();
-          feature_pipeline.AcceptWaveform(samp_freq, wave_part);
-          samp_count += chunk_len;
-
-          if (silence_weighting.Active() &&
-              feature_pipeline.IvectorFeature() != NULL) {
-            silence_weighting.ComputeCurrentTraceback(decoder.Decoder());
-            silence_weighting.GetDeltaWeights(feature_pipeline.NumFramesReady(),
-                                              frame_offset * decodable_opts.frame_subsampling_factor,
-                                              &delta_weights);
-            feature_pipeline.UpdateFrameWeights(delta_weights);
-          }
-
-          decoder.AdvanceDecoding();
-
-          if (samp_count > check_count) {
-            if (decoder.NumFramesDecoded() > 0) {
-              Lattice lat;
-              decoder.GetBestPath(false, &lat);
-              TopSort(&lat); // for LatticeStateTimes(),
-              std::string msg = LatticeToString(lat, *word_syms);
-
-              // get time-span after previous endpoint,
-              if (produce_time) {
-                int32 t_beg = frame_offset;
-                int32 t_end = frame_offset + GetLatticeTimeSpan(lat);
-                msg = GetTimeString(t_beg, t_end, frame_shift * frame_subsampling) + " " + msg;
-              }
-
-              KALDI_VLOG(1) << "Temporary transcript: " << msg;
-              server.WriteLn(msg, "\r");
-            }
-            check_count += check_period;
-          }
-
-          if (decoder.EndpointDetected(endpoint_opts)) {
-            decoder.FinalizeDecoding();
-            frame_offset += decoder.NumFramesDecoded();
-            CompactLattice lat;
-            decoder.GetLattice(true, &lat);
-            std::string msg = LatticeToString(lat, *word_syms);
-
-            // get time-span between endpoints,
-            if (produce_time) {
-              int32 t_beg = frame_offset - decoder.NumFramesDecoded();
-              int32 t_end = frame_offset;
-              msg = GetTimeString(t_beg, t_end, frame_shift * frame_subsampling) + " " + msg;
-            }
-
-            KALDI_VLOG(1) << "Endpoint, sending message: " << msg;
-            server.WriteLn(msg);
-            break; // while (true)
-          }
-        }
-      }
     }
   } catch (const std::exception &e) {
     std::cerr << e.what();
@@ -339,152 +284,306 @@ int main(int argc, char *argv[]) {
 
 
 namespace kaldi {
-TcpServer::TcpServer(int read_timeout) {
-  server_desc_ = -1;
-  client_desc_ = -1;
-  samp_buf_ = NULL;
-  buf_len_ = 0;
-  read_timeout_ = 1000 * read_timeout;
+
+	TcpServer::TcpServer() {
+		server_desc_ = -1;
+	}
+
+	bool TcpServer::Listen(int32 port) {
+		h_addr_.sin_addr.s_addr = INADDR_ANY;
+		h_addr_.sin_port = htons(port);
+		h_addr_.sin_family = AF_INET;
+
+		server_desc_ = socket(AF_INET, SOCK_STREAM, 0);
+
+		if (server_desc_ == -1) {
+			KALDI_ERR << "Cannot create TCP socket!";
+			return false;
+		}
+
+		int32 flag = 1;
+		int32 len = sizeof(int32);
+		if (setsockopt(server_desc_, SOL_SOCKET, SO_REUSEADDR, &flag, len) == -1) {
+			KALDI_ERR << "Cannot set socket options!";
+			return false;
+		}
+
+		if (bind(server_desc_, (struct sockaddr *) &h_addr_, sizeof(h_addr_)) == -1) {
+			KALDI_ERR << "Cannot bind to port: " << port << " (is it taken?)";
+			return false;
+		}
+
+		if (listen(server_desc_, 1) == -1) {
+			KALDI_ERR << "Cannot listen on port!";
+			return false;
+		}
+
+		KALDI_LOG << "TcpServer: Listening on port: " << port;
+
+		return true;
+
+	}
+
+	TcpServer::~TcpServer() {
+		// TO DO. Disconnect All;
+		if (server_desc_ != -1)
+			close(server_desc_);
+	}
+
+	int32 TcpServer::Accept() {
+		KALDI_LOG << "Waiting for client...";
+
+		socklen_t len;
+
+		len = sizeof(struct sockaddr);
+		int32 client_desc_ = accept(server_desc_, (struct sockaddr *) &h_addr_, &len);
+
+		struct sockaddr_storage addr;
+		char ipstr[20];
+
+		len = sizeof addr;
+		getpeername(client_desc_, (struct sockaddr *) &addr, &len);
+
+		struct sockaddr_in *s = (struct sockaddr_in *) &addr;
+		inet_ntop(AF_INET, &s->sin_addr, ipstr, sizeof ipstr);
+
+		KALDI_LOG << "Accepted connection from: " << ipstr;
+
+		return client_desc_;
+	}
+
+	DecodingThread::DecodingThread(int32 client_desc, int read_timeout, OnlineNnet2FeaturePipelineInfo *feature_info_, LatticeFasterDecoderConfig *decoder_opts_,
+		TransitionModel *trans_model_, nnet3::DecodableNnetSimpleLoopedInfo *decodable_info_, fst::Fst<fst::StdArc> *decode_fst_,
+		nnet3::NnetSimpleLoopedComputationOptions *decodable_opts_, fst::SymbolTable *word_syms_, BaseFloat frame_shift_,
+		int32 frame_subsampling_, OnlineEndpointConfig *endpoint_opts_, BaseFloat chunk_length_secs_, BaseFloat output_period_,
+		BaseFloat samp_freq_) 
+	{
+		client_desc_ = client_desc;
+		client_set_[0].fd = client_desc_;
+		client_set_[0].events = POLLIN;
+
+		samp_buf_ = NULL;
+		buf_len_ = 0;
+		read_timeout_ = 1000 * read_timeout;
+
+		feature_info = feature_info_;
+		decoder_opts = decoder_opts_;
+		trans_model = trans_model_;
+		decodable_info = decodable_info_;
+		decode_fst = decode_fst_;
+		decodable_opts = decodable_opts_;
+		word_syms = word_syms_;
+		frame_shift = frame_shift_;
+		frame_subsampling = frame_subsampling_;
+		endpoint_opts = endpoint_opts_;
+		chunk_length_secs = chunk_length_secs_;
+		output_period = output_period_;
+		samp_freq = samp_freq_;
+	}
+
+	void DecodingThread::StartDecoding()
+	{
+
+		int32 samp_count = 0;// this is used for output refresh rate
+		size_t chunk_len = static_cast<size_t>(chunk_length_secs * samp_freq);
+		int32 check_period = static_cast<int32>(samp_freq * output_period);
+		int32 check_count = check_period;
+
+		int32 frame_offset = 0;
+
+		bool eos = false;
+		bool produce_time = false;
+
+		OnlineNnet2FeaturePipeline feature_pipeline(*feature_info);
+		SingleUtteranceNnet3Decoder decoder(*decoder_opts, *trans_model,
+			*decodable_info,
+			*decode_fst, &feature_pipeline);
+
+		while (!eos) {
+
+			decoder.InitDecoding(frame_offset);
+
+			OnlineSilenceWeighting silence_weighting(
+				*trans_model,
+				feature_info->silence_weighting_config,
+				decodable_opts->frame_subsampling_factor);
+
+			std::vector<std::pair<int32, BaseFloat>> delta_weights;
+
+			while (true) {
+
+				eos = !ReadChunk(chunk_len);
+
+				if (eos) {
+					feature_pipeline.InputFinished();
+
+					decoder.AdvanceDecoding();
+
+					decoder.FinalizeDecoding();
+
+					frame_offset += decoder.NumFramesDecoded();
+
+
+					if (decoder.NumFramesDecoded() > 0) {
+						CompactLattice lat;
+
+						decoder.GetLattice(true, &lat);
+						std::string msg = LatticeToString(lat, *word_syms);
+
+						// get time-span from previous endpoint to end of audio,
+						if (produce_time) {
+							int32 t_beg = frame_offset - decoder.NumFramesDecoded();
+							int32 t_end = frame_offset;
+							msg = GetTimeString(t_beg, t_end, frame_shift * frame_subsampling) + " " + msg;
+						}
+
+						KALDI_VLOG(1) << "EndOfAudio, sending message: " << msg;
+						WriteLn(msg);
+					}
+					else
+						Write("\n");
+					Disconnect();
+					break;
+				}
+
+				Vector<BaseFloat> wave_part = GetChunk();
+				feature_pipeline.AcceptWaveform(samp_freq, wave_part);
+				samp_count += chunk_len;
+
+				if (silence_weighting.Active() &&
+					feature_pipeline.IvectorFeature() != NULL) {
+					silence_weighting.ComputeCurrentTraceback(decoder.Decoder());
+					silence_weighting.GetDeltaWeights(feature_pipeline.NumFramesReady(),
+						frame_offset * decodable_opts->frame_subsampling_factor,
+						&delta_weights);
+					feature_pipeline.UpdateFrameWeights(delta_weights);
+				}
+
+				decoder.AdvanceDecoding();
+
+				if (samp_count > check_count) {
+					if (decoder.NumFramesDecoded() > 0) {
+						Lattice lat;
+						decoder.GetBestPath(false, &lat);
+						TopSort(&lat); // for LatticeStateTimes(),
+						std::string msg = LatticeToString(lat, *word_syms);
+
+						// get time-span after previous endpoint,
+						if (produce_time) {
+							int32 t_beg = frame_offset;
+							int32 t_end = frame_offset + GetLatticeTimeSpan(lat);
+							msg = GetTimeString(t_beg, t_end, frame_shift * frame_subsampling) + " " + msg;
+						}
+
+						KALDI_VLOG(1) << "Temporary transcript: " << msg;
+						WriteLn(msg, "\r");
+					}
+					check_count += check_period;
+				}
+
+				if (decoder.EndpointDetected(*endpoint_opts)) {
+					decoder.FinalizeDecoding();
+					frame_offset += decoder.NumFramesDecoded();
+					CompactLattice lat;
+					decoder.GetLattice(true, &lat);
+					std::string msg = LatticeToString(lat, *word_syms);
+
+					// get time-span between endpoints,
+					if (produce_time) {
+						int32 t_beg = frame_offset - decoder.NumFramesDecoded();
+						int32 t_end = frame_offset;
+						msg = GetTimeString(t_beg, t_end, frame_shift * frame_subsampling) + " " + msg;
+					}
+
+					KALDI_VLOG(1) << "Endpoint, sending message: " << msg;
+					WriteLn(msg);
+					break; // while (true)
+				}
+			}
+		}
+	}
+
+	bool DecodingThread::ReadChunk(size_t len) {
+
+		if (buf_len_ != len) {
+			buf_len_ = len;
+			delete[] samp_buf_;
+			samp_buf_ = new int16[len];
+		}
+
+		ssize_t ret;
+		int poll_ret;
+		size_t to_read = len;
+		has_read_ = 0;
+
+		while (to_read > 0) {
+			poll_ret = poll(client_set_, 1, read_timeout_);
+			if (poll_ret == 0) {
+				KALDI_WARN << "Socket timeout! Disconnecting...";
+				break;
+			}
+			if (poll_ret < 0) {
+				KALDI_WARN << "Socket error! Disconnecting...";
+				break;
+			}
+			ret = read(client_desc_, static_cast<void *>(samp_buf_ + has_read_), to_read * sizeof(int16));
+			if (ret <= 0) {
+				KALDI_WARN << "Stream over...";
+				break;
+			}
+			to_read -= ret / sizeof(int16);
+			has_read_ += ret / sizeof(int16);
+		}
+
+		return has_read_ > 0;
+	}
+
+	Vector<BaseFloat> DecodingThread::GetChunk() {
+		Vector<BaseFloat> buf;
+
+		buf.Resize(static_cast<MatrixIndexT>(has_read_));
+
+		for (int i = 0; i < has_read_; i++)
+			buf(i) = static_cast<BaseFloat>(samp_buf_[i]);
+
+		return buf;
+	}
+
+	bool DecodingThread::Write(const std::string &msg) {
+
+		const char *p = msg.c_str();
+		size_t to_write = msg.size();
+		size_t wrote = 0;
+		while (to_write > 0) {
+			ssize_t ret = write(client_desc_, static_cast<const void *>(p + wrote), to_write);
+			if (ret <= 0)
+				return false;
+
+			to_write -= ret;
+			wrote += ret;
+		}
+
+		return true;
+	}
+
+	bool DecodingThread::WriteLn(const std::string &msg, const std::string &eol) {
+		if (Write(msg))
+			return Write(eol);
+		else return false;
+	}
+
+	void DecodingThread::Disconnect() {
+		if (samp_buf_ != NULL)
+			delete[] samp_buf_;
+
+		if (client_desc_ != -1) {
+			close(client_desc_);
+			client_desc_ = -1;
+		}
+	}
+
+	DecodingThread::~DecodingThread()
+	{
+
+	}  // namespace kaldi
 }
-
-bool TcpServer::Listen(int32 port) {
-  h_addr_.sin_addr.s_addr = INADDR_ANY;
-  h_addr_.sin_port = htons(port);
-  h_addr_.sin_family = AF_INET;
-
-  server_desc_ = socket(AF_INET, SOCK_STREAM, 0);
-
-  if (server_desc_ == -1) {
-    KALDI_ERR << "Cannot create TCP socket!";
-    return false;
-  }
-
-  int32 flag = 1;
-  int32 len = sizeof(int32);
-  if (setsockopt(server_desc_, SOL_SOCKET, SO_REUSEADDR, &flag, len) == -1) {
-    KALDI_ERR << "Cannot set socket options!";
-    return false;
-  }
-
-  if (bind(server_desc_, (struct sockaddr *) &h_addr_, sizeof(h_addr_)) == -1) {
-    KALDI_ERR << "Cannot bind to port: " << port << " (is it taken?)";
-    return false;
-  }
-
-  if (listen(server_desc_, 1) == -1) {
-    KALDI_ERR << "Cannot listen on port!";
-    return false;
-  }
-
-  KALDI_LOG << "TcpServer: Listening on port: " << port;
-
-  return true;
-
-}
-
-TcpServer::~TcpServer() {
-  Disconnect();
-  if (server_desc_ != -1)
-    close(server_desc_);
-  delete[] samp_buf_;
-}
-
-int32 TcpServer::Accept() {
-  KALDI_LOG << "Waiting for client...";
-
-  socklen_t len;
-
-  len = sizeof(struct sockaddr);
-  client_desc_ = accept(server_desc_, (struct sockaddr *) &h_addr_, &len);
-
-  struct sockaddr_storage addr;
-  char ipstr[20];
-
-  len = sizeof addr;
-  getpeername(client_desc_, (struct sockaddr *) &addr, &len);
-
-  struct sockaddr_in *s = (struct sockaddr_in *) &addr;
-  inet_ntop(AF_INET, &s->sin_addr, ipstr, sizeof ipstr);
-
-  client_set_[0].fd = client_desc_;
-  client_set_[0].events = POLLIN;
-
-  KALDI_LOG << "Accepted connection from: " << ipstr;
-
-  return client_desc_;
-}
-
-bool TcpServer::ReadChunk(size_t len) {
-  if (buf_len_ != len) {
-    buf_len_ = len;
-    delete[] samp_buf_;
-    samp_buf_ = new int16[len];
-  }
-
-  ssize_t ret;
-  int poll_ret;
-  size_t to_read = len;
-  has_read_ = 0;
-  while (to_read > 0) {
-    poll_ret = poll(client_set_, 1, read_timeout_);
-    if (poll_ret == 0) {
-      KALDI_WARN << "Socket timeout! Disconnecting...";
-      break;
-    }
-    if (poll_ret < 0) {
-      KALDI_WARN << "Socket error! Disconnecting...";
-      break;
-    }
-    ret = read(client_desc_, static_cast<void *>(samp_buf_ + has_read_), to_read * sizeof(int16));
-    if (ret <= 0) {
-      KALDI_WARN << "Stream over...";
-      break;
-    }
-    to_read -= ret / sizeof(int16);
-    has_read_ += ret / sizeof(int16);
-  }
-
-  return has_read_ > 0;
-}
-
-Vector<BaseFloat> TcpServer::GetChunk() {
-  Vector<BaseFloat> buf;
-
-  buf.Resize(static_cast<MatrixIndexT>(has_read_));
-
-  for (int i = 0; i < has_read_; i++)
-    buf(i) = static_cast<BaseFloat>(samp_buf_[i]);
-
-  return buf;
-}
-
-bool TcpServer::Write(const std::string &msg) {
-
-  const char *p = msg.c_str();
-  size_t to_write = msg.size();
-  size_t wrote = 0;
-  while (to_write > 0) {
-    ssize_t ret = write(client_desc_, static_cast<const void *>(p + wrote), to_write);
-    if (ret <= 0)
-      return false;
-
-    to_write -= ret;
-    wrote += ret;
-  }
-
-  return true;
-}
-
-bool TcpServer::WriteLn(const std::string &msg, const std::string &eol) {
-  if (Write(msg))
-    return Write(eol);
-  else return false;
-}
-
-void TcpServer::Disconnect() {
-  if (client_desc_ != -1) {
-    close(client_desc_);
-    client_desc_ = -1;
-  }
-}
-}  // namespace kaldi
