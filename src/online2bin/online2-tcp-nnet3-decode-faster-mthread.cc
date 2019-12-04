@@ -38,7 +38,7 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <string>
-#include <pthread.h>
+#include <list>
 
 namespace kaldi {
 
@@ -153,6 +153,18 @@ void Work(kaldi::DecodingThread *dec)
 	dec->StartDecoding();
 }
 
+static bool RemoveInactive(kaldi::DecodingThread *item)
+{
+	if (!item->IsConnected())
+	{
+		delete item;
+		return true;
+	}
+	else {
+		return false;
+	}
+}
+
 int main(int argc, char *argv[]) {
   try {
     using namespace kaldi;
@@ -263,7 +275,7 @@ int main(int argc, char *argv[]) {
 
     server.Listen(port_num);
 
-	std::vector<DecodingThread*> decoders;
+	std::list<DecodingThread*> decoders;
 
     while (true) {
 
@@ -285,15 +297,8 @@ int main(int argc, char *argv[]) {
 			thread.detach();
 		}
 
-		std::for_each(decoders.begin(), decoders.end(), [](DecodingThread *d) { 
-			if (d != NULL)
-			{
-				if (!d->IsConnected())
-				{
-					delete d;
-				}
-			}
-		});
+		decoders.remove_if(RemoveInactive);
+
     }
   } catch (const std::exception &e) {
     std::cerr << e.what();
@@ -543,16 +548,16 @@ namespace kaldi {
 		while (to_read > 0) {
 			poll_ret = poll(client_set_, 1, read_timeout_);
 			if (poll_ret == 0) {
-				KALDI_WARN << "Key reading. Socket timeout! Disconnecting...";
+				KALDI_WARN << "Socket timeout! Disconnecting...";
 				break;
 			}
 			if (poll_ret < 0) {
-				KALDI_WARN << "Key reading. Socket error! Disconnecting...";
+				KALDI_WARN << "Socket error! Disconnecting...";
 				break;
 			}
 			ret = read(client_desc_, static_cast<void *>(samp_buf_ + has_read_), to_read * sizeof(int16));
 			if (ret <= 0) {
-				KALDI_WARN << "Key reading. Stream over...";
+				KALDI_WARN << "Stream over...";
 				break;
 			}
 			to_read -= ret / sizeof(int16);
@@ -574,16 +579,16 @@ namespace kaldi {
 		while (to_read > 0) {
 			poll_ret = poll(client_set_, 1, read_timeout_);
 			if (poll_ret == 0) {
-				KALDI_WARN << "Socket timeout! Disconnecting...";
+				KALDI_WARN << "Key reading. Socket timeout! Disconnecting...";
 				break;
 			}
 			if (poll_ret < 0) {
-				KALDI_WARN << "Socket error! Disconnecting...";
+				KALDI_WARN << "Key reading. Socket error! Disconnecting...";
 				break;
 			}
 			ret = read(client_desc_, static_cast<void *>(key_buff + bytes_read_), to_read * sizeof(char));
 			if (ret <= 0) {
-				KALDI_WARN << "Stream over...";
+				KALDI_WARN << "Key reading. Stream over...";
 				break;
 			}
 			to_read -= ret / sizeof(char);
