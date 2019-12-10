@@ -39,6 +39,7 @@
 #include <unistd.h>
 #include <string>
 #include <list>
+#include <fstream>
 
 namespace kaldi {
 
@@ -200,6 +201,8 @@ int main(int argc, char *argv[]) {
     int read_timeout = 3;
     bool produce_time = false;
 	std::string access_key = "";
+	std::string access_key_file = "";
+	std::list<std::string> keys_list;
 
     po.Register("samp-freq", &samp_freq,
                 "Sampling frequency of the input signal (coded as 16-bit slinear).");
@@ -219,6 +222,9 @@ int main(int argc, char *argv[]) {
 	po.Register("access-key", &access_key,
 		"Access key.");
 
+	po.Register("access-key-file", &access_key_file,
+		"Access key file. If specified, access-key ignored.");
+
     feature_opts.Register(&po);
     decodable_opts.Register(&po);
     decoder_opts.Register(&po);
@@ -230,6 +236,21 @@ int main(int argc, char *argv[]) {
       po.PrintUsage();
       return 1;
     }
+
+	ifstream keys_file;
+	keys_file.open(access_key_file, ios_base::in);
+
+	if (keys_file.is_open())
+	{
+		std::string line;
+		while (std::getline(keys_file, line)) {
+			keys_list.push_back(line);
+		}
+		keys_file.close();
+	}
+	else {
+		keys_list.push_back(access_key);
+	}
 
     std::string nnet3_rxfilename = po.GetArg(1),
         fst_rxfilename = po.GetArg(2),
@@ -284,9 +305,9 @@ int main(int argc, char *argv[]) {
 		DecodingThread *dec = new DecodingThread(client, read_timeout, &feature_info, &decoder_opts, &trans_model, &decodable_info, decode_fst, &decodable_opts,
 			word_syms, frame_shift, frame_subsampling, &endpoint_opts, chunk_length_secs, output_period, samp_freq);
 		
-		std::string key = dec->ReadKey(access_key.size());
+		std::string key = dec->ReadKey(64);
 		
-		if (access_key.compare(key) != 0)
+		if (std::find(std::begin(keys_list), std::end(keys_list), key) == std::end(keys_list))
 		{
 			dec->Disconnect();
 			delete dec;
