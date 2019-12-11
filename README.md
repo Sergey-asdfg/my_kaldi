@@ -72,3 +72,7 @@ Platform specific notes
  - Clients connections handling moved to separate threads. Each client connection processed by own thread, without limitaion by threads count.
  - Added --access-key command line parameter. First client data sended must be a key string, specifyed in this parameter.
    If client sended key is not fit, connection is closed by server.
+ - Added autostart scripts for online2-tcp-nnet3-decode-faster-mthread.
+   tools/autostart/kaldi - autostart script. After placing script to /etc/init.d, run command: sudo update-rc.d kaldi defaults
+   tools/autostart/params.cfg - command line parameters for for online2-tcp-nnet3-decode-faster-mthread to run by autostart script.
+   
